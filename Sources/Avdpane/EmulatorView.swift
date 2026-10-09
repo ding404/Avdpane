@@ -11,6 +11,7 @@ final class EmulatorView: NSView {
     private(set) var deviceHeight = 0
     private var frameCount = 0
     private var isTouching = false
+    private var systemNavigationKey: String?
     var hasActiveMouseTouch: Bool { isTouching }
     private var fpsTimer: Timer?
     private var streamTask: Task<Void, Never>?
@@ -91,6 +92,11 @@ final class EmulatorView: NSView {
                 }
             } catch {
                 print("stream on port \(port) ended: \(error)")
+                // streamFrames normally shuts down the failed transport itself. This second
+                // call also covers failures while creating the transport and makes the retry
+                // boundary explicit: no input or screenshot RPC is allowed to reuse a dead
+                // connection after a deadlineExceeded/unavailable error.
+                emulator.stopDisplayStream()
             }
             streamGeneration += 1
             if isCameraRecording || Date() < cameraScreenshotsResumeAt {
@@ -103,7 +109,9 @@ final class EmulatorView: NSView {
             let isRunning = AvdCatalog.runningEmulators().values.contains { $0.grpcPort == port }
             errorLabel.stringValue = isRunning ? "Waiting for emulator on port \(port)..." : "Emulator stopped"
             errorLabel.isHidden = false
-            try? await Task.sleep(for: .seconds(2))
+            // A failed screenshot is transient around Camera2 Activity transitions. Keep the
+            // retry fast so Back/Home does not look like it froze the emulator for two seconds.
+            try? await Task.sleep(for: .milliseconds(250))
         }
     }
 
@@ -187,6 +195,37 @@ final class EmulatorView: NSView {
         // Drags and the release may leave the phone rect, so clamp instead of dropping them.
         let clamped = NSPoint(x: min(max(point.x, rect.minX), rect.maxX), y: min(max(point.y, rect.minY), rect.maxY))
         guard let device = devicePoint(for: clamped) else { return }
+
+        // The Android navigation bar is part of the streamed screen. During a Camera2
+        // transition, sending its tap as a normal gRPC touch can share a connection with a
+        // stuck screenshot RPC, so map the three system buttons directly to adb instead.
+        if isDown {
+            if systemNavigationKey == nil,
+               let key = systemNavigationKey(at: device.x, y: device.y) {
+                systemNavigationKey = key
+                // Do not leave the last Camera/QR frame painted while the old display
+                // transport is being torn down. Android handles the ADB key immediately,
+                // but the replacement screenshot stream may need a few polling rounds to
+                // observe the Activity transition.
+                streamGeneration += 1
+                frameLayer.contents = nil
+                currentImage = nil
+                errorLabel.stringValue = "Refreshing emulator display..."
+                errorLabel.isHidden = false
+                // Android 10 may still return one cached Camera2 readback immediately
+                // after the Activity handles Back/Home. Keep the replacement stream from
+                // starting until the camera/display handoff has settled.
+                cameraScreenshotsResumeAt = max(
+                    cameraScreenshotsResumeAt,
+                    Date().addingTimeInterval(1.2))
+                emulator.sendSystemKey(name: key)
+            }
+            if systemNavigationKey != nil { return }
+        } else if systemNavigationKey != nil {
+            systemNavigationKey = nil
+            return
+        }
+
         // The Camera shutter is on the right-side control rail. Stop display
         // readback before forwarding the press; waiting for dumpsys to notice
         // RECORD is too late on Android 10 and can wedge the emulator's color
@@ -198,6 +237,25 @@ final class EmulatorView: NSView {
             if isDown { emulator.stopDisplayStream() }
         }
         emulator.sendTouch(x: device.x, y: device.y, isDown: isDown)
+    }
+
+    private func systemNavigationKey(at x: Int, y: Int) -> String? {
+        guard deviceWidth > 0, deviceHeight > 0 else { return nil }
+        if deviceWidth >= deviceHeight {
+            guard x >= deviceWidth - max(72, deviceWidth / 16) else { return nil }
+            switch Double(y) / Double(deviceHeight) {
+            case 0..<0.34: return "AppSwitch"
+            case 0.34..<0.66: return "GoHome"
+            default: return "GoBack"
+            }
+        } else {
+            guard y >= deviceHeight - max(72, deviceHeight / 16) else { return nil }
+            switch Double(x) / Double(deviceWidth) {
+            case 0..<0.34: return "GoBack"
+            case 0.34..<0.66: return "GoHome"
+            default: return "AppSwitch"
+            }
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -224,7 +282,10 @@ final class EmulatorView: NSView {
             123: "ArrowLeft", 124: "ArrowRight", 125: "ArrowDown", 126: "ArrowUp",
         ]
         if let name = specialKeys[event.keyCode] {
-            emulator.sendKey(name: name)
+            switch name {
+            case "GoBack", "GoHome", "AppSwitch": emulator.sendSystemKey(name: name)
+            default: emulator.sendKey(name: name)
+            }
         } else if let text = event.characters, !text.isEmpty {
             emulator.sendKey(text: text)
         }

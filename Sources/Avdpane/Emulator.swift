@@ -75,6 +75,16 @@ final class Emulator: Sendable {
                     onFrame(image)
                 } catch let error as RPCError where error.code == .failedPrecondition {
                     // No new frame is ready yet. Keep the connection and try the next tick.
+                } catch {
+                    // A screenshot timeout is recoverable, but the HTTP/2 connection that
+                    // carried the timed-out RPC is not reliable afterwards. In particular,
+                    // Android 10 can leave the display readback request alive while Camera2
+                    // is returning to the previous Activity. Explicitly tear this connection
+                    // down before propagating the error so streamForever can create a fresh
+                    // transport immediately. Without this, the window can remain on the last
+                    // QR frame even though Android has already handled Back.
+                    connection.beginGracefulShutdown()
+                    throw error
                 }
                 try await Task.sleep(for: .milliseconds(66))
             }
@@ -176,6 +186,14 @@ final class Emulator: Sendable {
         event.key = name
         event.text = text
         enqueue { [event] client in _ = try await client.sendKey(event) }
+    }
+
+    // Android's system navigation bar remains usable while Camera2 owns the display
+    // readback path. Close that display connection first, then send the navigation key
+    // through adb so a stale screenshot RPC cannot delay Back/Home/Recents.
+    @MainActor func sendSystemKey(name: String) {
+        stopDisplayStream()
+        sendKey(name: name)
     }
 
     // A quarter turn each time, like the emulator's own rotate button. Reads the current
