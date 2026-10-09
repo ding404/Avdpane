@@ -50,10 +50,12 @@ final class Emulator: Sendable {
             return options
         }()
         let transport = try makeTransport()
+        let streamReady = Mutex(false)
         // `withGRPCClient` starts its connection manager before invoking the handler. If the
         // emulator's gRPC endpoint is half-open after Camera2 releases the display, the handler
         // can wait indefinitely for a ready HTTP/2 connection even though port 8554 is listening.
-        // Keep the reconnect loop live by racing the client against a short connection watchdog.
+        // Keep the reconnect loop live by racing the first frame against a short connection
+        // watchdog. Once a frame has arrived, the watchdog stays alive but no longer expires.
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await withGRPCClient(transport: transport) { connection in
@@ -87,6 +89,7 @@ final class Emulator: Sendable {
                                 try await Task.sleep(for: .milliseconds(66))
                                 continue
                             }
+                            streamReady.withLock { $0 = true }
                             onFrame(image)
                         } catch let error as RPCError where error.code == .failedPrecondition {
                             // No new frame is ready yet. Keep the connection and try the next tick.
@@ -107,6 +110,12 @@ final class Emulator: Sendable {
             }
             group.addTask {
                 try await Task.sleep(for: .seconds(3))
+                guard !streamReady.withLock({ $0 }) else {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(60))
+                    }
+                    return
+                }
                 transport.beginGracefulShutdown()
                 throw DisplayStreamConnectionTimeout()
             }
