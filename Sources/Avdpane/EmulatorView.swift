@@ -241,20 +241,15 @@ final class EmulatorView: NSView {
 
     private func systemNavigationKey(at x: Int, y: Int) -> String? {
         guard deviceWidth > 0, deviceHeight > 0 else { return nil }
-        if deviceWidth >= deviceHeight {
-            guard x >= deviceWidth - max(72, deviceWidth / 16) else { return nil }
-            switch Double(y) / Double(deviceHeight) {
-            case 0..<0.34: return "AppSwitch"
-            case 0.34..<0.66: return "GoHome"
-            default: return "GoBack"
-            }
-        } else {
-            guard y >= deviceHeight - max(72, deviceHeight / 16) else { return nil }
-            switch Double(x) / Double(deviceWidth) {
-            case 0..<0.34: return "GoBack"
-            case 0.34..<0.66: return "GoHome"
-            default: return "AppSwitch"
-            }
+        // Android10Tablet keeps its three-button navigation bar along the bottom even
+        // in landscape. Do not infer its location from the aspect ratio: that would
+        // classify normal top-right controls (for example WeChat's '+' button) as the
+        // system Recents button and unnecessarily tear down the display stream.
+        guard y >= deviceHeight - max(72, deviceHeight / 16) else { return nil }
+        switch Double(x) / Double(deviceWidth) {
+        case 0..<0.34: return "GoBack"
+        case 0.34..<0.66: return "GoHome"
+        default: return "AppSwitch"
         }
     }
 
