@@ -14,6 +14,11 @@ final class DeviceWindowController: NSWindowController, NSWindowDelegate {
     var pasteboardChangeCount = 0
     // Last text that crossed in either direction, so it does not bounce back.
     var lastSyncedText: String?
+    private var titlebarMouseMonitor: Any?
+    private var titlebarHideTimer: Timer?
+    private var isFullscreenTitlebarVisible = true
+    private var hasRequestedInitialFullscreen = false
+    private var cameraRecoveryTask: Task<Void, Never>?
     var adbSerial: String? { AvdCatalog.runningEmulators()[avd.id]?.adbSerial }
 
     init(avd: Avd, port: Int) {
@@ -33,6 +38,8 @@ final class DeviceWindowController: NSWindowController, NSWindowDelegate {
         // No aspect lock on the window, the view letterboxes, so Split View can make it any shape.
         window.minSize = NSSize(width: 200, height: 300)
         window.backgroundColor = .black
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
         window.delegate = self
 
         sidebar.widthAnchor.constraint(equalToConstant: 56).isActive = true
@@ -51,6 +58,8 @@ final class DeviceWindowController: NSWindowController, NSWindowDelegate {
         installApkDrop()
         applyAlwaysOnTop()
         startClipboardSync()
+        recoverFromCameraIfNeeded()
+        installFullscreenTitlebarHandling()
         window.setFrameAutosaveName("device-\(avd.id)")
     }
 
@@ -81,11 +90,113 @@ final class DeviceWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         AppDelegate.shared.deviceWindows.removeAll { $0 === self }
         stopClipboardSync()
+        if let monitor = titlebarMouseMonitor { NSEvent.removeMonitor(monitor) }
+        titlebarMouseMonitor = nil
+        titlebarHideTimer?.invalidate()
+        cameraRecoveryTask?.cancel()
         emulatorView.stop()
         emulator.shutdown()
     }
 
     @objc private func applySidebarSetting() {
         sidebar.isHidden = !Settings.isSidebarShown
+    }
+
+    private func installFullscreenTitlebarHandling() {
+        titlebarMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: .mouseMoved) { [weak self] event in
+            guard let self, let window = self.window, event.window === window,
+                  window.styleMask.contains(.fullScreen) else { return event }
+            let top = window.contentView?.bounds.maxY ?? 0
+            if event.locationInWindow.y >= top - 28 {
+                self.showFullscreenTitlebar()
+            } else {
+                self.scheduleFullscreenTitlebarHide()
+            }
+            return event
+        }
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        window?.styleMask.insert(.fullSizeContentView)
+        showFullscreenTitlebar()
+        scheduleFullscreenTitlebarHide()
+    }
+
+    func windowWillExitFullScreen(_ notification: Notification) {
+        showFullscreenTitlebar()
+        titlebarHideTimer?.invalidate()
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        window?.styleMask.remove(.fullSizeContentView)
+        showFullscreenTitlebar()
+    }
+
+    private func showFullscreenTitlebar() {
+        guard let window, window.styleMask.contains(.fullScreen) else { return }
+        titlebarHideTimer?.invalidate()
+        titlebarHideTimer = nil
+        guard !isFullscreenTitlebarVisible else { return }
+        isFullscreenTitlebarVisible = true
+        window.titleVisibility = .visible
+        window.toolbar?.isVisible = true
+        for button in [window.standardWindowButton(.closeButton),
+                       window.standardWindowButton(.miniaturizeButton),
+                       window.standardWindowButton(.zoomButton)] {
+            button?.isHidden = false
+        }
+    }
+
+    private func scheduleFullscreenTitlebarHide() {
+        guard let window, window.styleMask.contains(.fullScreen) else { return }
+        titlebarHideTimer?.invalidate()
+        titlebarHideTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.hideFullscreenTitlebar() }
+        }
+    }
+
+    private func hideFullscreenTitlebar() {
+        guard let window, window.styleMask.contains(.fullScreen), isFullscreenTitlebarVisible else { return }
+        let top = window.contentView?.bounds.maxY ?? 0
+        let mouse = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        guard mouse.y < top - 28 else {
+            scheduleFullscreenTitlebarHide()
+            return
+        }
+        isFullscreenTitlebarVisible = false
+        window.titleVisibility = .hidden
+        window.toolbar?.isVisible = false
+        for button in [window.standardWindowButton(.closeButton),
+                       window.standardWindowButton(.miniaturizeButton),
+                       window.standardWindowButton(.zoomButton)] {
+            button?.isHidden = true
+        }
+    }
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        guard !hasRequestedInitialFullscreen, let window, !window.styleMask.contains(.fullScreen) else { return }
+        hasRequestedInitialFullscreen = true
+        Task { @MainActor [weak self] in
+            guard let self, let window = self.window, !window.styleMask.contains(.fullScreen) else { return }
+            window.toggleFullScreen(nil)
+        }
+    }
+
+    private func recoverFromCameraIfNeeded() {
+        cameraRecoveryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                guard let serial = self.adbSerial else {
+                    try? await Task.sleep(for: .milliseconds(300))
+                    continue
+                }
+                let didRedirect = await Task.detached {
+                    AvdCatalog.redirectSystemCameraToBridge(serial: serial)
+                }.value
+                if didRedirect { print("system Camera redirected to Camera Bridge") }
+                try? await Task.sleep(for: .milliseconds(didRedirect ? 1000 : 400))
+            }
+        }
     }
 }

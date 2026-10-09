@@ -21,21 +21,40 @@ final class Emulator: Sendable {
         try HTTP2ClientTransport.Posix(target: .ipv4(address: "127.0.0.1", port: port), transportSecurity: .plaintext)
     }
 
-    // Runs until the stream ends or fails. Frames arrive as ready to draw CGImages.
-    func streamFrames(_ onFrame: @Sendable @escaping (CGImage) -> Void) async throws {
+    // Polling keeps camera video frames from starving while the display stays responsive.
+    // During recording the caller can pause screenshots entirely: Android 10's emulated
+    // camera shares the display readback path and otherwise loses encoded video frames.
+    func streamFrames(
+        _ onFrame: @Sendable @escaping (CGImage) -> Void,
+        pauseWhen: @Sendable @escaping () async -> Bool = { false }
+    ) async throws {
         var format = Android_Emulation_Control_ImageFormat()
         format.format = .rgb888
+        // Smaller frames leave enough graphics bandwidth for camera video encoding.
+        format.width = 640
         // Frames are raw RGB, a 1080x2340 screen is 7.6 MB, well over the 4 MB gRPC default.
         // The NIO transport sizes its inbound decoder from the request limit, so set both.
         var options = CallOptions.defaults
+        // A camera can take ownership of display readback while a screenshot RPC
+        // is in flight. Bound that request so the stream connection is released
+        // promptly instead of holding the camera's input/encoder path open.
+        options.timeout = .milliseconds(500)
         options.maxRequestMessageBytes = 64 << 20
         options.maxResponseMessageBytes = 64 << 20
         try await withGRPCClient(transport: makeTransport()) { connection in
             grpc.withLock { $0 = connection }
             defer { grpc.withLock { $0 = nil } }
             let client = Client(wrapping: connection)
-            try await client.streamScreenshot(format, options: options) { response in
-                for try await frame in response.messages {
+            while !Task.isCancelled {
+                if await pauseWhen() {
+                    // Closing the connection is important on Android 10. Merely skipping
+                    // new RPCs leaves an in-flight display readback alive long enough to
+                    // starve StageFright's camera encoder. streamForever reconnects after
+                    // recording ends and restores the live display automatically.
+                    return
+                }
+                do {
+                    let frame = try await client.getScreenshot(format, options: options)
                     var width = Int(frame.format.width), height = Int(frame.format.height)
                     if width == 0 {
                         let display = try await client.getDisplayConfigurations(.init()).displays.first
@@ -47,19 +66,37 @@ final class Emulator: Sendable {
                         let image = CGImage(
                             width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 24,
                             bytesPerRow: width * 3, space: CGColorSpaceCreateDeviceRGB(),
-                            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
-                            provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
-                    else { continue }
+                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                        provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+                    else {
+                        try await Task.sleep(for: .milliseconds(66))
+                        continue
+                    }
                     onFrame(image)
+                } catch let error as RPCError where error.code == .failedPrecondition {
+                    // No new frame is ready yet. Keep the connection and try the next tick.
                 }
+                try await Task.sleep(for: .milliseconds(66))
             }
         }
     }
 
     // Input must reach the phone in the order it happened, so each send waits for the one before.
     @MainActor private var lastSend: Task<Void, Never>?
+    @MainActor private var lastAdbInput: Task<Void, Never>?
+    @MainActor private var adbTouchStart: (x: Int, y: Int)?
+    @MainActor private var adbTouchMoved = false
     // A burst of input while disconnected logs one line, not one per event.
     @MainActor private var isDropLogged = false
+
+    @MainActor private func enqueueAdb(_ arguments: [String]) {
+        guard let serial = AvdCatalog.runningEmulators().values.first(where: { $0.grpcPort == port })?.adbSerial else { return }
+        let previous = lastAdbInput
+        lastAdbInput = Task {
+            await previous?.value
+            _ = await Task.detached(operation: { AvdCatalog.adb(["-s", serial] + arguments) }).value
+        }
+    }
 
     @MainActor private func enqueue(_ send: @Sendable @escaping (Client) async throws -> Void) {
         guard let connection = grpc.withLock({ $0 }) else {
@@ -77,6 +114,31 @@ final class Emulator: Sendable {
 
     // ponytail: single finger only, identifier is always 0.
     @MainActor func sendTouch(x: Int, y: Int, isDown: Bool) {
+        guard grpc.withLock({ $0 }) != nil else {
+            if isDown {
+                if let previous = adbTouchStart {
+                    adbTouchMoved = true
+                    enqueueAdb(["shell", "input", "swipe", "\(previous.x)", "\(previous.y)", "\(x)", "\(y)", "80"])
+                } else {
+                    adbTouchStart = (x, y)
+                }
+            } else {
+                if let start = adbTouchStart {
+                    if adbTouchMoved {
+                        enqueueAdb(["shell", "input", "swipe", "\(start.x)", "\(start.y)", "\(x)", "\(y)", "80"])
+                    } else {
+                        // Android 10 Camera can drop a zero-duration ADB tap on
+                        // the recording shutter. A short same-point swipe is still
+                        // a click to normal apps, but gives Camera a real press /
+                        // release interval so stopping recording is reliable.
+                        enqueueAdb(["shell", "input", "swipe", "\(x)", "\(y)", "\(x)", "\(y)", "120"])
+                    }
+                }
+                adbTouchStart = nil
+                adbTouchMoved = false
+            }
+            return
+        }
         var touch = Android_Emulation_Control_Touch()
         touch.x = Int32(x)
         touch.y = Int32(y)
@@ -88,6 +150,27 @@ final class Emulator: Sendable {
 
     // Pass either a w3c key name like "Enter" or plain text, never both.
     @MainActor func sendKey(name: String = "", text: String = "") {
+        guard grpc.withLock({ $0 }) != nil else {
+            let keycode: String? = switch name {
+            case "GoBack": "KEYCODE_BACK"
+            case "GoHome": "KEYCODE_HOME"
+            case "AppSwitch": "KEYCODE_APP_SWITCH"
+            case "Power": "KEYCODE_POWER"
+            case "Enter": "KEYCODE_ENTER"
+            case "Backspace", "Delete": "KEYCODE_DEL"
+            case "ArrowLeft": "KEYCODE_DPAD_LEFT"
+            case "ArrowRight": "KEYCODE_DPAD_RIGHT"
+            case "ArrowUp": "KEYCODE_DPAD_UP"
+            case "ArrowDown": "KEYCODE_DPAD_DOWN"
+            default: nil
+            }
+            if let keycode {
+                enqueueAdb(["shell", "input", "keyevent", keycode])
+            } else if !text.isEmpty {
+                enqueueAdb(["shell", "input", "text", text.replacingOccurrences(of: " ", with: "%s")])
+            }
+            return
+        }
         var event = Android_Emulation_Control_KeyboardEvent()
         event.eventType = .keypress
         event.key = name
@@ -119,6 +202,15 @@ final class Emulator: Sendable {
         _ = try await Android_Emulation_Control_UiController.Client(wrapping: connection).showExtendedControls(entry)
     }
 
+    @MainActor func stopDisplayStream() {
+        let connection = grpc.withLock { current in
+            let connection = current
+            current = nil
+            return connection
+        }
+        connection?.beginGracefulShutdown()
+    }
+
     @MainActor func setClipboard(_ text: String) {
         var clip = Android_Emulation_Control_ClipData()
         clip.text = text
@@ -138,6 +230,7 @@ final class Emulator: Sendable {
     // Stops queued input and closes the connection. The owners cancel the stream tasks themselves.
     @MainActor func shutdown() {
         lastSend?.cancel()
-        grpc.withLock { $0 }?.beginGracefulShutdown()
+        lastAdbInput?.cancel()
+        stopDisplayStream()
     }
 }
