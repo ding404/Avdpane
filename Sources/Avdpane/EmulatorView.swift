@@ -241,16 +241,31 @@ final class EmulatorView: NSView {
 
     private func systemNavigationKey(at x: Int, y: Int) -> String? {
         guard deviceWidth > 0, deviceHeight > 0 else { return nil }
-        // Android10Tablet keeps its three-button navigation bar along the bottom even
-        // in landscape. Do not infer its location from the aspect ratio: that would
-        // classify normal top-right controls (for example WeChat's '+' button) as the
-        // system Recents button and unnecessarily tear down the display stream.
-        guard y >= deviceHeight - max(72, deviceHeight / 16) else { return nil }
-        switch Double(x) / Double(deviceWidth) {
-        case 0..<0.34: return "GoBack"
-        case 0.34..<0.66: return "GoHome"
-        default: return "AppSwitch"
+        // Android10Tablet normally places the three-button navigation bar along the
+        // bottom, but Camera/WeChat scan can rotate it to the right edge. Do not infer
+        // the location from the aspect ratio: the app can change orientation without
+        // changing the host window. Only the centered three-button slots are active,
+        // so top-right controls such as WeChat's '+' are never treated as navigation.
+        if x >= deviceWidth - max(72, deviceWidth / 16) {
+            switch Double(y) / Double(deviceHeight) {
+            // devicePoint() converts from AppKit's bottom-left origin. For this
+            // landscape stream the visible rail maps to these device-coordinate
+            // bands: Recents at the upper band, Home in the middle, Back below.
+            case 0.20..<0.40: return "AppSwitch"
+            case 0.40..<0.60: return "GoHome"
+            case 0.60..<0.85: return "GoBack"
+            default: return nil
+            }
         }
+        if y >= deviceHeight - max(72, deviceHeight / 16) {
+            switch Double(x) / Double(deviceWidth) {
+            case 0.20..<0.40: return "GoBack"
+            case 0.40..<0.60: return "GoHome"
+            case 0.60..<0.80: return "AppSwitch"
+            default: return nil
+            }
+        }
+        return nil
     }
 
     override func mouseDown(with event: NSEvent) {
