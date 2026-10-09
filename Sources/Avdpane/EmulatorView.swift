@@ -201,24 +201,9 @@ final class EmulatorView: NSView {
         // stuck screenshot RPC, so map the three system buttons directly to adb instead.
         if isDown {
             if systemNavigationKey == nil,
-               let key = systemNavigationKey(at: device.x, y: device.y) {
+               let key = systemNavigationKey(at: clamped) {
                 systemNavigationKey = key
-                // Do not leave the last Camera/QR frame painted while the old display
-                // transport is being torn down. Android handles the ADB key immediately,
-                // but the replacement screenshot stream may need a few polling rounds to
-                // observe the Activity transition.
-                streamGeneration += 1
-                frameLayer.contents = nil
-                currentImage = nil
-                errorLabel.stringValue = "Refreshing emulator display..."
-                errorLabel.isHidden = false
-                // Android 10 may still return one cached Camera2 readback immediately
-                // after the Activity handles Back/Home. Keep the replacement stream from
-                // starting until the camera/display handoff has settled.
-                cameraScreenshotsResumeAt = max(
-                    cameraScreenshotsResumeAt,
-                    Date().addingTimeInterval(1.2))
-                emulator.sendSystemKey(name: key)
+                emulator.sendSystemKeyDirect(name: key)
             }
             if systemNavigationKey != nil { return }
         } else if systemNavigationKey != nil {
@@ -239,29 +224,37 @@ final class EmulatorView: NSView {
         emulator.sendTouch(x: device.x, y: device.y, isDown: isDown)
     }
 
-    private func systemNavigationKey(at x: Int, y: Int) -> String? {
-        guard deviceWidth > 0, deviceHeight > 0 else { return nil }
-        // Android10Tablet normally places the three-button navigation bar along the
-        // bottom, but Camera/WeChat scan can rotate it to the right edge. Do not infer
-        // the location from the aspect ratio: the app can change orientation without
-        // changing the host window. Only the centered three-button slots are active,
-        // so top-right controls such as WeChat's '+' are never treated as navigation.
-        if x >= deviceWidth - max(72, deviceWidth / 16) {
-            switch Double(y) / Double(deviceHeight) {
-            // devicePoint() converts from AppKit's bottom-left origin. For this
-            // landscape stream the visible rail maps to these device-coordinate
-            // bands: Recents at the upper band, Home in the middle, Back below.
-            case 0.20..<0.40: return "AppSwitch"
+    private func systemNavigationKey(at viewPoint: NSPoint) -> String? {
+        let rect = phoneRect
+        guard rect.width > 0, rect.height > 0 else { return nil }
+
+        // Use the visible screen position rather than device coordinates. The streamed
+        // image can rotate while the host view keeps its size, and devicePoint() has a
+        // different origin from AppKit. Visual coordinates keep the button order stable.
+        let x = (viewPoint.x - rect.minX) / rect.width
+        let yFromTop = (rect.maxY - viewPoint.y) / rect.height
+        guard (0...1).contains(x), (0...1).contains(yFromTop) else { return nil }
+
+        // Android10Tablet can move the three-button bar between the bottom and right
+        // edge independently of the frame's width/height (an Activity may lock a
+        // different orientation than the display). Keep both edge hit tests active,
+        // but use the actual minimum bar thickness instead of a narrow 1/16 strip.
+        let rightBarFraction = max(72.0 / CGFloat(deviceWidth), 1.0 / 16.0)
+        if x >= 1 - rightBarFraction {
+            switch yFromTop {
+            case 0.10..<0.40: return "AppSwitch"
             case 0.40..<0.60: return "GoHome"
-            case 0.60..<0.85: return "GoBack"
+            case 0.60..<0.90: return "GoBack"
             default: return nil
             }
         }
-        if y >= deviceHeight - max(72, deviceHeight / 16) {
-            switch Double(x) / Double(deviceWidth) {
-            case 0.20..<0.40: return "GoBack"
+
+        let bottomBarFraction = max(72.0 / CGFloat(deviceHeight), 1.0 / 16.0)
+        if yFromTop >= 1 - bottomBarFraction {
+            switch x {
+            case 0.10..<0.40: return "GoBack"
             case 0.40..<0.60: return "GoHome"
-            case 0.60..<0.80: return "AppSwitch"
+            case 0.60..<0.90: return "AppSwitch"
             default: return nil
             }
         }

@@ -232,6 +232,19 @@ final class Emulator: Sendable {
         sendKey(name: name)
     }
 
+    // Navigation taps from the streamed screen should not tear down that stream. ADB
+    // delivers the system key independently, so the next frame can show the new Activity
+    // without flashing the host-side "Refreshing emulator display..." state.
+    @MainActor func sendSystemKeyDirect(name: String) {
+        let keycode: String? = switch name {
+        case "GoBack": "KEYCODE_BACK"
+        case "GoHome": "KEYCODE_HOME"
+        case "AppSwitch": "KEYCODE_APP_SWITCH"
+        default: nil
+        }
+        if let keycode { enqueueAdb(["shell", "input", "keyevent", keycode]) }
+    }
+
     // A quarter turn each time, like the emulator's own rotate button. Reads the current
     // angle first so a window opened on an already turned emulator keeps counting from there.
     @MainActor func rotate() {
