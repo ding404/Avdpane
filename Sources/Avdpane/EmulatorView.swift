@@ -11,7 +11,6 @@ final class EmulatorView: NSView {
     private(set) var deviceHeight = 0
     private var frameCount = 0
     private var isTouching = false
-    private var systemNavigationKey: String?
     var hasActiveMouseTouch: Bool { isTouching }
     private var fpsTimer: Timer?
     private var streamTask: Task<Void, Never>?
@@ -196,21 +195,6 @@ final class EmulatorView: NSView {
         let clamped = NSPoint(x: min(max(point.x, rect.minX), rect.maxX), y: min(max(point.y, rect.minY), rect.maxY))
         guard let device = devicePoint(for: clamped) else { return }
 
-        // The Android navigation bar is part of the streamed screen. During a Camera2
-        // transition, sending its tap as a normal gRPC touch can share a connection with a
-        // stuck screenshot RPC, so map the three system buttons directly to adb instead.
-        if isDown {
-            if systemNavigationKey == nil,
-               let key = systemNavigationKey(at: clamped) {
-                systemNavigationKey = key
-                emulator.sendSystemKeyDirect(name: key)
-            }
-            if systemNavigationKey != nil { return }
-        } else if systemNavigationKey != nil {
-            systemNavigationKey = nil
-            return
-        }
-
         // The Camera shutter is on the right-side control rail. Stop display
         // readback before forwarding the press; waiting for dumpsys to notice
         // RECORD is too late on Android 10 and can wedge the emulator's color
@@ -222,43 +206,6 @@ final class EmulatorView: NSView {
             if isDown { emulator.stopDisplayStream() }
         }
         emulator.sendTouch(x: device.x, y: device.y, isDown: isDown)
-    }
-
-    private func systemNavigationKey(at viewPoint: NSPoint) -> String? {
-        let rect = phoneRect
-        guard rect.width > 0, rect.height > 0 else { return nil }
-
-        // Use the visible screen position rather than device coordinates. The streamed
-        // image can rotate while the host view keeps its size, and devicePoint() has a
-        // different origin from AppKit. Visual coordinates keep the button order stable.
-        let x = (viewPoint.x - rect.minX) / rect.width
-        let yFromTop = (rect.maxY - viewPoint.y) / rect.height
-        guard (0...1).contains(x), (0...1).contains(yFromTop) else { return nil }
-
-        // Android10Tablet can move the three-button bar between the bottom and right
-        // edge independently of the frame's width/height (an Activity may lock a
-        // different orientation than the display). Keep both edge hit tests active,
-        // but use the actual minimum bar thickness instead of a narrow 1/16 strip.
-        let rightBarFraction = max(72.0 / CGFloat(deviceWidth), 1.0 / 16.0)
-        if x >= 1 - rightBarFraction {
-            switch yFromTop {
-            case 0.10..<0.40: return "AppSwitch"
-            case 0.40..<0.60: return "GoHome"
-            case 0.60..<0.90: return "GoBack"
-            default: return nil
-            }
-        }
-
-        let bottomBarFraction = max(72.0 / CGFloat(deviceHeight), 1.0 / 16.0)
-        if yFromTop >= 1 - bottomBarFraction {
-            switch x {
-            case 0.10..<0.40: return "GoBack"
-            case 0.40..<0.60: return "GoHome"
-            case 0.60..<0.90: return "AppSwitch"
-            default: return nil
-            }
-        }
-        return nil
     }
 
     override func mouseDown(with event: NSEvent) {
