@@ -5,6 +5,8 @@ import GRPCNIOTransportHTTP2
 import GRPCProtobuf
 import Synchronization
 
+private struct DisplayStreamConnectionTimeout: Error {}
+
 // Thin gRPC client for the running emulator. Input calls are fire and forget.
 final class Emulator: Sendable {
     private typealias Client = Android_Emulation_Control_EmulatorController.Client<HTTP2ClientTransport.Posix>
@@ -28,66 +30,91 @@ final class Emulator: Sendable {
         _ onFrame: @Sendable @escaping (CGImage) -> Void,
         pauseWhen: @Sendable @escaping () async -> Bool = { false }
     ) async throws {
-        var format = Android_Emulation_Control_ImageFormat()
-        format.format = .rgb888
-        // Smaller frames leave enough graphics bandwidth for camera video encoding.
-        format.width = 640
+        let format: Android_Emulation_Control_ImageFormat = {
+            var format = Android_Emulation_Control_ImageFormat()
+            format.format = .rgb888
+            // Smaller frames leave enough graphics bandwidth for camera video encoding.
+            format.width = 640
+            return format
+        }()
         // Frames are raw RGB, a 1080x2340 screen is 7.6 MB, well over the 4 MB gRPC default.
         // The NIO transport sizes its inbound decoder from the request limit, so set both.
-        var options = CallOptions.defaults
-        // A camera can take ownership of display readback while a screenshot RPC
-        // is in flight. Bound that request so the stream connection is released
-        // promptly instead of holding the camera's input/encoder path open.
-        options.timeout = .milliseconds(500)
-        options.maxRequestMessageBytes = 64 << 20
-        options.maxResponseMessageBytes = 64 << 20
-        try await withGRPCClient(transport: makeTransport()) { connection in
-            grpc.withLock { $0 = connection }
-            defer { grpc.withLock { $0 = nil } }
-            let client = Client(wrapping: connection)
-            while !Task.isCancelled {
-                if await pauseWhen() {
-                    // Closing the connection is important on Android 10. Merely skipping
-                    // new RPCs leaves an in-flight display readback alive long enough to
-                    // starve StageFright's camera encoder. streamForever reconnects after
-                    // recording ends and restores the live display automatically.
-                    return
-                }
-                do {
-                    let frame = try await client.getScreenshot(format, options: options)
-                    var width = Int(frame.format.width), height = Int(frame.format.height)
-                    if width == 0 {
-                        let display = try await client.getDisplayConfigurations(.init()).displays.first
-                        width = Int(display?.width ?? 0)
-                        height = Int(display?.height ?? 0)
-                    }
-                    guard width > 0, height > 0,
-                        let provider = CGDataProvider(data: frame.image as CFData),
-                        let image = CGImage(
-                            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 24,
-                            bytesPerRow: width * 3, space: CGColorSpaceCreateDeviceRGB(),
-                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
-                        provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
-                    else {
+        let options: CallOptions = {
+            var options = CallOptions.defaults
+            // A camera can take ownership of display readback while a screenshot RPC
+            // is in flight. Bound that request so the stream connection is released
+            // promptly instead of holding the camera's input/encoder path open.
+            options.timeout = .milliseconds(500)
+            options.maxRequestMessageBytes = 64 << 20
+            options.maxResponseMessageBytes = 64 << 20
+            return options
+        }()
+        let transport = try makeTransport()
+        // `withGRPCClient` starts its connection manager before invoking the handler. If the
+        // emulator's gRPC endpoint is half-open after Camera2 releases the display, the handler
+        // can wait indefinitely for a ready HTTP/2 connection even though port 8554 is listening.
+        // Keep the reconnect loop live by racing the client against a short connection watchdog.
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await withGRPCClient(transport: transport) { connection in
+                    self.grpc.withLock { $0 = connection }
+                    defer { self.grpc.withLock { $0 = nil } }
+                    let client = Client(wrapping: connection)
+                    while !Task.isCancelled {
+                        if await pauseWhen() {
+                            // Closing the connection is important on Android 10. Merely skipping
+                            // new RPCs leaves an in-flight display readback alive long enough to
+                            // starve StageFright's camera encoder. streamForever reconnects after
+                            // recording ends and restores the live display automatically.
+                            return
+                        }
+                        do {
+                            let frame = try await client.getScreenshot(format, options: options)
+                            var width = Int(frame.format.width), height = Int(frame.format.height)
+                            if width == 0 {
+                                let display = try await client.getDisplayConfigurations(.init()).displays.first
+                                width = Int(display?.width ?? 0)
+                                height = Int(display?.height ?? 0)
+                            }
+                            guard width > 0, height > 0,
+                                let provider = CGDataProvider(data: frame.image as CFData),
+                                let image = CGImage(
+                                    width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 24,
+                                    bytesPerRow: width * 3, space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                                provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+                            else {
+                                try await Task.sleep(for: .milliseconds(66))
+                                continue
+                            }
+                            onFrame(image)
+                        } catch let error as RPCError where error.code == .failedPrecondition {
+                            // No new frame is ready yet. Keep the connection and try the next tick.
+                        } catch {
+                            // A screenshot timeout is recoverable, but the HTTP/2 connection that
+                            // carried the timed-out RPC is not reliable afterwards. In particular,
+                            // Android 10 can leave the display readback request alive while Camera2
+                            // is returning to the previous Activity. Explicitly tear this connection
+                            // down before propagating the error so streamForever can create a fresh
+                            // transport immediately. Without this, the window can remain on the last
+                            // QR frame even though Android has already handled Back.
+                            connection.beginGracefulShutdown()
+                            throw error
+                        }
                         try await Task.sleep(for: .milliseconds(66))
-                        continue
                     }
-                    onFrame(image)
-                } catch let error as RPCError where error.code == .failedPrecondition {
-                    // No new frame is ready yet. Keep the connection and try the next tick.
-                } catch {
-                    // A screenshot timeout is recoverable, but the HTTP/2 connection that
-                    // carried the timed-out RPC is not reliable afterwards. In particular,
-                    // Android 10 can leave the display readback request alive while Camera2
-                    // is returning to the previous Activity. Explicitly tear this connection
-                    // down before propagating the error so streamForever can create a fresh
-                    // transport immediately. Without this, the window can remain on the last
-                    // QR frame even though Android has already handled Back.
-                    connection.beginGracefulShutdown()
-                    throw error
                 }
-                try await Task.sleep(for: .milliseconds(66))
             }
+            group.addTask {
+                try await Task.sleep(for: .seconds(3))
+                transport.beginGracefulShutdown()
+                throw DisplayStreamConnectionTimeout()
+            }
+            defer {
+                group.cancelAll()
+                transport.beginGracefulShutdown()
+            }
+            try await group.next()
         }
     }
 
