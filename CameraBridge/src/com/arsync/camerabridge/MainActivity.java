@@ -5,8 +5,8 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.graphics.Matrix;
+import android.graphics.Color;
 import android.graphics.SurfaceTexture;
-import android.graphics.RectF;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
@@ -38,6 +38,7 @@ import java.util.List;
 public final class MainActivity extends Activity {
     private static final int REQUEST_PERMISSIONS = 7;
     private TextureView preview;
+    private FrameLayout root;
     private Button recordButton;
     private CameraManager cameraManager;
     private CameraDevice camera;
@@ -85,7 +86,8 @@ public final class MainActivity extends Activity {
                         | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                         | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
 
-        FrameLayout root = new FrameLayout(this);
+        root = new FrameLayout(this);
+        root.setBackgroundColor(Color.BLACK);
         preview = new TextureView(this);
         root.addView(preview, new FrameLayout.LayoutParams(-1, -1));
 
@@ -185,7 +187,13 @@ public final class MainActivity extends Activity {
         List<Size> candidates = new ArrayList<>(Arrays.asList(sizes));
         Collections.sort(candidates, (left, right) -> Long.compare(area(right), area(left)));
         Size best = null;
+        // Match the emulator Camera app's native landscape stream.  The
+        // display transform below rotates this 16:9 buffer with the device
+        // instead of stretching it into the current screen orientation.
         double target = 16.0 / 9.0;
+        for (Size size : candidates) {
+            if (size.getWidth() == 1280 && size.getHeight() == 720) return size;
+        }
         double bestDifference = Double.MAX_VALUE;
         for (Size size : candidates) {
             if (size.getWidth() > 1920 || size.getHeight() > 1080) continue;
@@ -204,14 +212,39 @@ public final class MainActivity extends Activity {
 
     private void applyPreviewTransform(int viewWidth, int viewHeight) {
         if (preview == null || previewSize == null || viewWidth == 0 || viewHeight == 0) return;
-        float scale = Math.max((float) viewWidth / previewSize.getWidth(),
-                (float) viewHeight / previewSize.getHeight());
-        float scaledWidth = previewSize.getWidth() * scale;
-        float scaledHeight = previewSize.getHeight() * scale;
+        int rotation = getWindowManager().getDefaultDisplay().getRotation();
+        int degrees = rotation == Surface.ROTATION_90 ? 90
+                : rotation == Surface.ROTATION_180 ? 180
+                : rotation == Surface.ROTATION_270 ? 270 : 0;
+        boolean swapsAxes = degrees == 90 || degrees == 270;
+        float bufferWidth = swapsAxes ? previewSize.getHeight() : previewSize.getWidth();
+        float bufferHeight = swapsAxes ? previewSize.getWidth() : previewSize.getHeight();
+        // The camera stream is 1280x720.  After a 90-degree display rotation
+        // its displayed size is 720x1280; it must never be resized independently
+        // on the two axes.  Fill the TextureView with one uniform scale and
+        // crop the excess at the edges.  This is the same aspect-ratio behavior
+        // as a normal camera preview and avoids stretching faces/hands.
+        float scale = Math.max(viewWidth / bufferWidth, viewHeight / bufferHeight);
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) preview.getLayoutParams();
+        if (params.width != -1 || params.height != -1 || params.gravity != Gravity.NO_GRAVITY) {
+            params.width = -1;
+            params.height = -1;
+            params.gravity = Gravity.NO_GRAVITY;
+            preview.setLayoutParams(params);
+        }
         Matrix transform = new Matrix();
-        transform.setScale(scale, scale);
-        transform.postTranslate((viewWidth - scaledWidth) / 2.0f, (viewHeight - scaledHeight) / 2.0f);
+        transform.setTranslate(-previewSize.getWidth() / 2.0f, -previewSize.getHeight() / 2.0f);
+        transform.postRotate(degrees);
+        transform.postScale(scale, scale);
+        transform.postTranslate(viewWidth / 2.0f, viewHeight / 2.0f);
         preview.setTransform(transform);
+    }
+
+    @Override public void onConfigurationChanged(android.content.res.Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        if (preview != null && preview.isAvailable()) {
+            preview.post(() -> applyPreviewTransform(preview.getWidth(), preview.getHeight()));
+        }
     }
 
     private void createPreviewSession() {

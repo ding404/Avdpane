@@ -18,7 +18,6 @@ final class DeviceWindowController: NSWindowController, NSWindowDelegate {
     private var titlebarHideTimer: Timer?
     private var isFullscreenTitlebarVisible = true
     private var hasRequestedInitialFullscreen = false
-    private var cameraRecoveryTask: Task<Void, Never>?
     var adbSerial: String? { AvdCatalog.runningEmulators()[avd.id]?.adbSerial }
 
     init(avd: Avd, port: Int) {
@@ -58,7 +57,6 @@ final class DeviceWindowController: NSWindowController, NSWindowDelegate {
         installApkDrop()
         applyAlwaysOnTop()
         startClipboardSync()
-        recoverFromCameraIfNeeded()
         installFullscreenTitlebarHandling()
         window.setFrameAutosaveName("device-\(avd.id)")
     }
@@ -93,7 +91,6 @@ final class DeviceWindowController: NSWindowController, NSWindowDelegate {
         if let monitor = titlebarMouseMonitor { NSEvent.removeMonitor(monitor) }
         titlebarMouseMonitor = nil
         titlebarHideTimer?.invalidate()
-        cameraRecoveryTask?.cancel()
         emulatorView.stop()
         emulator.shutdown()
     }
@@ -183,20 +180,4 @@ final class DeviceWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    private func recoverFromCameraIfNeeded() {
-        cameraRecoveryTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                guard let serial = self.adbSerial else {
-                    try? await Task.sleep(for: .milliseconds(300))
-                    continue
-                }
-                let didRedirect = await Task.detached {
-                    AvdCatalog.redirectSystemCameraToBridge(serial: serial)
-                }.value
-                if didRedirect { print("system Camera redirected to Camera Bridge") }
-                try? await Task.sleep(for: .milliseconds(didRedirect ? 1000 : 400))
-            }
-        }
-    }
 }

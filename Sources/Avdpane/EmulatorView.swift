@@ -11,13 +11,13 @@ final class EmulatorView: NSView {
     private(set) var deviceHeight = 0
     private var frameCount = 0
     private var isTouching = false
+    private var touchUsesAdb = false
     var hasActiveMouseTouch: Bool { isTouching }
     private var fpsTimer: Timer?
     private var streamTask: Task<Void, Never>?
     private var cameraMonitorTask: Task<Void, Never>?
     private var isCameraInUse = false
     private var isCameraRecording = false
-    private var cameraScreenshotsResumeAt = Date.distantPast
     // Frames carry the attempt they came from, so a late one cannot show after that attempt ended.
     private var streamGeneration = 0
     private(set) var currentImage: CGImage?
@@ -68,14 +68,6 @@ final class EmulatorView: NSView {
     // Keeps retrying so the window survives the emulator being killed and restarted.
     private func streamForever() async {
         while !Task.isCancelled {
-            let isRecording = await MainActor.run { self.isCameraRecording }
-            if isRecording {
-                // Camera2 recording must own the emulator's graphics path. The
-                // monitor closes the gRPC stream when RECORD starts.
-                try? await Task.sleep(for: .milliseconds(150))
-                continue
-            }
-
             streamGeneration += 1
             let generation = streamGeneration
             do {
@@ -83,10 +75,10 @@ final class EmulatorView: NSView {
                     Task { @MainActor in
                         if generation == self.streamGeneration { self.show(image) }
                     }
-                } pauseWhen: { [weak self] in
+                } frameInterval: { [weak self] in
                     await MainActor.run {
-                        guard let self else { return false }
-                        return self.isCameraRecording || Date() < self.cameraScreenshotsResumeAt
+                        guard let self, self.isCameraRecording else { return .milliseconds(66) }
+                        return .milliseconds(200)
                     }
                 }
             } catch {
@@ -98,43 +90,50 @@ final class EmulatorView: NSView {
                 emulator.stopDisplayStream()
             }
             streamGeneration += 1
-            if isCameraRecording || Date() < cameraScreenshotsResumeAt {
-                try? await Task.sleep(for: .milliseconds(150))
-                continue
-            }
-            // Drop the stale frame so the message shows on black, not over the last screen.
-            frameLayer.contents = nil
-            currentImage = nil
             let isRunning = AvdCatalog.runningEmulators().values.contains { $0.grpcPort == port }
-            errorLabel.stringValue = isRunning ? "Waiting for emulator on port \(port)..." : "Emulator stopped"
-            errorLabel.isHidden = false
+            if isRunning {
+                // Back/Home intentionally closes the old display connection before sending
+                // the key, and the replacement stream takes a short moment to connect. Keep
+                // the last frame visible during that handoff instead of flashing the window
+                // black. `show(_:)` hides this label as soon as the first fresh frame arrives.
+                errorLabel.isHidden = true
+            } else {
+                frameLayer.contents = nil
+                currentImage = nil
+                errorLabel.stringValue = "Emulator stopped"
+                errorLabel.isHidden = false
+            }
             // A failed screenshot is transient around Camera2 Activity transitions. Keep the
             // retry fast so Back/Home does not look like it froze the emulator for two seconds.
             try? await Task.sleep(for: .milliseconds(250))
         }
     }
 
-    // Camera opens before recording starts. Polling the camera service lets normal
-    // display streaming continue for all other apps while avoiding the Android 10
-    // camera/display readback conflict for the complete Camera session.
+    // Camera opens before recording starts. Polling the camera service lets the
+    // display stream slow down for the encoder-sensitive RECORD state.
     private func monitorCameraUse() async {
         while !Task.isCancelled {
             let serial = AvdCatalog.runningEmulators().values.first { $0.grpcPort == port }?.adbSerial
-            let state = await Task.detached {
-                guard let serial else { return AvdCatalog.CameraState(isInUse: false, isRecording: false) }
+            let state: AvdCatalog.CameraState? = await Task.detached {
+                guard let serial else { return nil }
                 return AvdCatalog.cameraState(serial: serial)
             }.value
+            guard let state else {
+                try? await Task.sleep(for: .milliseconds(150))
+                continue
+            }
             let inUse = state.isInUse
             let recording = state.isRecording
             if inUse != isCameraInUse || recording != isCameraRecording {
-                if isCameraRecording && !recording {
-                    cameraScreenshotsResumeAt = Date().addingTimeInterval(0.7)
+                if isCameraRecording && !recording, let serial {
+                    Task.detached {
+                        AvdCatalog.normalizeLatestCameraVideo(serial: serial)
+                    }
                 }
                 isCameraInUse = inUse
                 isCameraRecording = recording
                 if recording {
-                    print("camera recording: pausing screenshots")
-                    emulator.stopDisplayStream()
+                    print("camera recording: throttling live screenshots")
                 } else if inUse {
                     print("camera preview: using gRPC display stream")
                 } else {
@@ -195,22 +194,17 @@ final class EmulatorView: NSView {
         let clamped = NSPoint(x: min(max(point.x, rect.minX), rect.maxX), y: min(max(point.y, rect.minY), rect.maxY))
         guard let device = devicePoint(for: clamped) else { return }
 
-        // The Camera shutter is on the right-side control rail. Stop display
-        // readback before forwarding the press; waiting for dumpsys to notice
-        // RECORD is too late on Android 10 and can wedge the emulator's color
-        // buffers. The preview resumes after Camera leaves RECORD.
-        if isCameraInUse && device.x >= Int(Double(deviceWidth) * 0.84) {
-            cameraScreenshotsResumeAt = max(
-                cameraScreenshotsResumeAt,
-                Date().addingTimeInterval(1.0))
-            if isDown { emulator.stopDisplayStream() }
-        }
-        emulator.sendTouch(x: device.x, y: device.y, isDown: isDown)
+        // Camera2/QR activities may accept the display gRPC connection while silently
+        // dropping its touch stream. Send raw coordinates through adb for the whole
+        // camera session. This view never classifies coordinates as navigation keys or
+        // camera controls; Android itself decides which window receives the touch.
+        emulator.sendTouch(x: device.x, y: device.y, isDown: isDown, preferAdb: touchUsesAdb)
     }
 
     override func mouseDown(with event: NSEvent) {
         guard phoneRect.contains(convert(event.locationInWindow, from: nil)) else { return }
         isTouching = true
+        touchUsesAdb = isCameraInUse
         sendTouch(event, isDown: true)
     }
 
@@ -222,6 +216,7 @@ final class EmulatorView: NSView {
         guard isTouching else { return }
         isTouching = false
         sendTouch(event, isDown: false)
+        touchUsesAdb = false
     }
 
     override func keyDown(with event: NSEvent) {

@@ -15,6 +15,9 @@ final class Emulator: Sendable {
     private let grpc = Mutex<GRPCClient<HTTP2ClientTransport.Posix>?>(nil)
     // Angle set by the last rotate. The emulator reports mid animation angles for a moment after a set.
     private let rotation = Mutex<Float?>(nil)
+    // Logical display and last frame sizes, used to map frame pixels to ADB input coordinates.
+    private let displaySize = Mutex<(width: Int, height: Int)?>(nil)
+    private let frameSize = Mutex<(width: Int, height: Int)?>(nil)
 
     init(port: Int) { self.port = port }
 
@@ -23,12 +26,13 @@ final class Emulator: Sendable {
         try HTTP2ClientTransport.Posix(target: .ipv4(address: "127.0.0.1", port: port), transportSecurity: .plaintext)
     }
 
-    // Polling keeps camera video frames from starving while the display stays responsive.
-    // During recording the caller can pause screenshots entirely: Android 10's emulated
-    // camera shares the display readback path and otherwise loses encoded video frames.
+    // Polling keeps the emulator display responsive when it is safe to read frames.
+    // Android 10's Camera2 encoder must own the graphics readback path while recording,
+    // so callers can pause this stream for the duration of a video capture.
     func streamFrames(
         _ onFrame: @Sendable @escaping (CGImage) -> Void,
-        pauseWhen: @Sendable @escaping () async -> Bool = { false }
+        frameInterval: @Sendable @escaping () async -> Duration = { .milliseconds(66) },
+        shouldContinue: @Sendable @escaping () async -> Bool = { true }
     ) async throws {
         let format: Android_Emulation_Control_ImageFormat = {
             var format = Android_Emulation_Control_ImageFormat()
@@ -44,13 +48,16 @@ final class Emulator: Sendable {
             // A camera can take ownership of display readback while a screenshot RPC
             // is in flight. Bound that request so the stream connection is released
             // promptly instead of holding the camera's input/encoder path open.
-            options.timeout = .milliseconds(500)
+            options.timeout = .milliseconds(1500)
             options.maxRequestMessageBytes = 64 << 20
             options.maxResponseMessageBytes = 64 << 20
             return options
         }()
         let transport = try makeTransport()
         let streamReady = Mutex(false)
+        let lastDisplayConfigurationRefresh = Mutex(Date.distantPast)
+        let timeoutCount = Mutex(0)
+        let stalledFrameCount = Mutex(0)
         // `withGRPCClient` starts its connection manager before invoking the handler. If the
         // emulator's gRPC endpoint is half-open after Camera2 releases the display, the handler
         // can wait indefinitely for a ready HTTP/2 connection even though port 8554 is listening.
@@ -62,13 +69,18 @@ final class Emulator: Sendable {
                     self.grpc.withLock { $0 = connection }
                     defer { self.grpc.withLock { $0 = nil } }
                     let client = Client(wrapping: connection)
+                    if let size = await self.logicalDisplaySize() { self.displaySize.withLock { $0 = size } }
                     while !Task.isCancelled {
-                        if await pauseWhen() {
-                            // Closing the connection is important on Android 10. Merely skipping
-                            // new RPCs leaves an in-flight display readback alive long enough to
-                            // starve StageFright's camera encoder. streamForever reconnects after
-                            // recording ends and restores the live display automatically.
-                            return
+                        guard await shouldContinue() else { return }
+                        // Camera activities can flip the logical display to portrait without a new
+                        // gRPC connection, so keep the ADB input space current on this stream.
+                        let refreshDisplayConfiguration = lastDisplayConfigurationRefresh.withLock { last in
+                            guard Date().timeIntervalSince(last) >= 0.5 else { return false }
+                            last = Date()
+                            return true
+                        }
+                        if refreshDisplayConfiguration, let size = await self.logicalDisplaySize() {
+                            self.displaySize.withLock { $0 = size }
                         }
                         do {
                             let frame = try await client.getScreenshot(format, options: options)
@@ -89,10 +101,28 @@ final class Emulator: Sendable {
                                 try await Task.sleep(for: .milliseconds(66))
                                 continue
                             }
+                            timeoutCount.withLock { $0 = 0 }
+                            stalledFrameCount.withLock { $0 = 0 }
+                            self.frameSize.withLock { $0 = (width, height) }
                             streamReady.withLock { $0 = true }
                             onFrame(image)
                         } catch let error as RPCError where error.code == .failedPrecondition {
-                            // No new frame is ready yet. Keep the connection and try the next tick.
+                            let shouldReconnect = stalledFrameCount.withLock { count in
+                                count += 1
+                                return count >= 30
+                            }
+                            if shouldReconnect {
+                                connection.beginGracefulShutdown()
+                                throw error
+                            }
+                        } catch let error as RPCError where error.code == .deadlineExceeded {
+                            let shouldReconnect = timeoutCount.withLock { count in
+                                count += 1
+                                return count >= 4
+                            }
+                            if !shouldReconnect { continue }
+                            connection.beginGracefulShutdown()
+                            throw error
                         } catch {
                             // A screenshot timeout is recoverable, but the HTTP/2 connection that
                             // carried the timed-out RPC is not reliable afterwards. In particular,
@@ -104,7 +134,7 @@ final class Emulator: Sendable {
                             connection.beginGracefulShutdown()
                             throw error
                         }
-                        try await Task.sleep(for: .milliseconds(66))
+                        try await Task.sleep(for: await frameInterval())
                     }
                 }
             }
@@ -158,31 +188,13 @@ final class Emulator: Sendable {
         }
     }
 
-    // ponytail: single finger only, identifier is always 0.
-    @MainActor func sendTouch(x: Int, y: Int, isDown: Bool) {
-        guard grpc.withLock({ $0 }) != nil else {
-            if isDown {
-                if let previous = adbTouchStart {
-                    adbTouchMoved = true
-                    enqueueAdb(["shell", "input", "swipe", "\(previous.x)", "\(previous.y)", "\(x)", "\(y)", "80"])
-                } else {
-                    adbTouchStart = (x, y)
-                }
-            } else {
-                if let start = adbTouchStart {
-                    if adbTouchMoved {
-                        enqueueAdb(["shell", "input", "swipe", "\(start.x)", "\(start.y)", "\(x)", "\(y)", "80"])
-                    } else {
-                        // Android 10 Camera can drop a zero-duration ADB tap on
-                        // the recording shutter. A short same-point swipe is still
-                        // a click to normal apps, but gives Camera a real press /
-                        // release interval so stopping recording is reliable.
-                        enqueueAdb(["shell", "input", "swipe", "\(x)", "\(y)", "\(x)", "\(y)", "120"])
-                    }
-                }
-                adbTouchStart = nil
-                adbTouchMoved = false
-            }
+    // ponytail: single finger only, identifier is always 0. Camera2 apps can keep the
+    // gRPC input endpoint alive while dropping its touch events, so callers can request
+    // the same raw touch to be delivered through adb. Android still performs the hit test;
+    // Avdpane never interprets the coordinates as Back/Home/Recents.
+    @MainActor func sendTouch(x: Int, y: Int, isDown: Bool, preferAdb: Bool = false) {
+        if preferAdb || grpc.withLock({ $0 }) == nil {
+            sendTouchViaAdb(x: x, y: y, isDown: isDown)
             return
         }
         var touch = Android_Emulation_Control_Touch()
@@ -192,6 +204,29 @@ final class Emulator: Sendable {
         var event = Android_Emulation_Control_TouchEvent()
         event.touches = [touch]
         enqueue { [event] client in _ = try await client.sendTouch(event) }
+    }
+
+    @MainActor private func sendTouchViaAdb(x: Int, y: Int, isDown: Bool) {
+        let point = adbPoint(x: x, y: y)
+        if isDown {
+            if let previous = adbTouchStart {
+                adbTouchMoved = true
+                enqueueAdb(["shell", "input", "swipe", "\(previous.x)", "\(previous.y)", "\(point.x)", "\(point.y)", "80"])
+            } else {
+                adbTouchStart = point
+            }
+        } else {
+            if let start = adbTouchStart {
+                if adbTouchMoved {
+                    enqueueAdb(["shell", "input", "swipe", "\(start.x)", "\(start.y)", "\(point.x)", "\(point.y)", "80"])
+                } else {
+                    // A short same-point swipe gives Android a real press/release interval.
+                    enqueueAdb(["shell", "input", "swipe", "\(point.x)", "\(point.y)", "\(point.x)", "\(point.y)", "120"])
+                }
+            }
+            adbTouchStart = nil
+            adbTouchMoved = false
+        }
     }
 
     // Pass either a w3c key name like "Enter" or plain text, never both.
@@ -286,5 +321,27 @@ final class Emulator: Sendable {
         lastSend?.cancel()
         lastAdbInput?.cancel()
         stopDisplayStream()
+    }
+
+    // ADB input uses the logical display. A landscape skin frame shown on a portrait
+    // logical display (Camera activities) is turned a quarter turn to match it.
+    private func adbPoint(x: Int, y: Int) -> (x: Int, y: Int) {
+        guard let display = displaySize.withLock({ $0 }),
+              let frame = frameSize.withLock({ $0 }),
+              frame.width > 1, frame.height > 1 else { return (x, y) }
+        let fractionX = Double(x) / Double(frame.width - 1)
+        let fractionY = Double(y) / Double(frame.height - 1)
+        let frameIsDisplayOriented = (frame.width <= frame.height) == (display.width <= display.height)
+        if frameIsDisplayOriented {
+            return (Int((fractionX * Double(display.width - 1)).rounded()),
+                    Int((fractionY * Double(display.height - 1)).rounded()))
+        }
+        return (Int(((1 - fractionY) * Double(display.width - 1)).rounded()),
+                Int((fractionX * Double(display.height - 1)).rounded()))
+    }
+
+    private func logicalDisplaySize() async -> (width: Int, height: Int)? {
+        guard let serial = AvdCatalog.runningEmulators().values.first(where: { $0.grpcPort == port })?.adbSerial else { return nil }
+        return await Task.detached { AvdCatalog.logicalDisplaySize(serial: serial) }.value
     }
 }

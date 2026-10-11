@@ -19,9 +19,6 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/Avdpane "$APP/Contents/MacOS/Avdpane"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-if [ -f CameraBridge/build/CameraBridge.apk ]; then
-  cp CameraBridge/build/CameraBridge.apk "$APP/Contents/Resources/CameraBridge.apk"
-fi
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -57,6 +54,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <string>The Android emulator uses your Mac camera when you select it as a virtual camera.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>The Android emulator uses your Mac microphone when recording video.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Avdpane captures the selected desktop QR code and sends it to the Android emulator camera.</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Avdpane talks to Android emulators running on this Mac.</string>
 </dict>
